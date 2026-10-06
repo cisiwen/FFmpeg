@@ -30,6 +30,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/stereo3d.h"
 #include "libavutil/time.h"
+#include "libavutil/thread.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/video_hint.h"
 #include "avcodec.h"
@@ -47,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // from x264.h, for quant_offsets, Macroblocks are 16x16
 // blocks of pixels (with respect to the luma plane)
@@ -108,6 +110,9 @@ typedef struct X264Context {
     int avcintra_class;
     int motion_est;
     int forced_idr;
+    char *idr_trigger_file;
+    int64_t idr_trigger_pts_offset;
+    unsigned idr_seen_generation;
     int coder;
     int a53_cc;
     int b_frame_strategy;
@@ -465,6 +470,130 @@ static int setup_roi(AVCodecContext *ctx, x264_picture_t *pic,
     return 0;
 }
 
+/*
+ * Externally triggered, process-wide forced IDR (-idr-trigger-file).
+ *
+ * A live SCTE-35 splice needs a real IDR at an instant nobody knew in
+ * advance, which neither -g/-keyint_min (periodic) nor -force_key_frames
+ * (pre-known timestamps) can express. Instead, the encoder watches a file:
+ * whenever its identity or modification time changes, one IDR is forced. A
+ * file, not a signal, so nothing can interrupt ffmpeg's blocking I/O.
+ *
+ * The file may hold a target presentation time in seconds, as it will appear
+ * in the *output stream* (-idr-trigger-pts-offset, 1.4s by default, is what
+ * the mpegts muxer adds to every timestamp, and is subtracted to get back to
+ * this encoder's own timeline): the IDR is forced on the first frame at or
+ * after it, so the caller can place it exactly relative to other things in
+ * the stream. Empty or unreadable content means "a little from now".
+ *
+ * Every encoder in the process shares one request, so all renditions of an
+ * ABR ladder force their IDR on the very same source frame regardless of how
+ * far apart their encoder threads happen to be.
+ */
+#define IDR_TRIGGER_LEAD_US 300000
+
+static AVMutex idr_mutex = AV_MUTEX_INITIALIZER;
+static struct stat idr_last_stat;
+static int idr_have_stat;
+static unsigned idr_generation;
+static int64_t idr_target_us;
+
+static char idr_last_content[64];
+
+/* Reads up to size-1 bytes of the trigger file; returns 0 if it can't. */
+static int idr_read_content(const char *path, char *buf, size_t size)
+{
+    FILE *f = fopen(path, "r");
+    size_t n;
+
+    if (!f)
+        return 0;
+    n = fread(buf, 1, size - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    return 1;
+}
+
+/* A trigger is a change in the file's identity, size or (whole-second) mtime,
+ * or in its content. The content is what makes this reliable: two triggers in
+ * the same second can share an inode and size, but never a target time. (The
+ * nanosecond mtime would also tell them apart, but isn't visible under the
+ * strict C standard ffmpeg builds with.) */
+static int idr_file_changed(const struct stat *st, const char *content)
+{
+    return !idr_have_stat ||
+           st->st_ino != idr_last_stat.st_ino || st->st_size != idr_last_stat.st_size ||
+           st->st_mtime != idr_last_stat.st_mtime ||
+           strcmp(content, idr_last_content) != 0;
+}
+
+/* Reads the target time from the trigger file; falls back to "a little from
+ * now" when it holds no usable time. */
+static int64_t idr_read_target(const char *path, int64_t offset_us, int64_t pts_us)
+{
+    int64_t target = pts_us + IDR_TRIGGER_LEAD_US;
+    FILE *f = fopen(path, "r");
+    double t;
+
+    if (f) {
+        if (fscanf(f, "%lf", &t) == 1 && t >= 0 && t < 1e9) {
+            int64_t want = (int64_t)(t * 1e6) - offset_us;
+            if (want < pts_us)
+                want = pts_us;
+            if (want <= pts_us + 60000000)
+                target = want;
+        }
+        fclose(f);
+    }
+    return target;
+}
+
+/* Record the trigger file's current state, so a file that already exists at
+ * startup does not count as a request. */
+static void idr_trigger_init(X264Context *x4)
+{
+    struct stat st;
+
+    if (!x4->idr_trigger_file)
+        return;
+    ff_mutex_lock(&idr_mutex);
+    if (!idr_have_stat && stat(x4->idr_trigger_file, &st) == 0 &&
+        idr_read_content(x4->idr_trigger_file, idr_last_content, sizeof(idr_last_content))) {
+        idr_last_stat = st;
+        idr_have_stat = 1;
+    }
+    x4->idr_seen_generation = idr_generation;
+    ff_mutex_unlock(&idr_mutex);
+}
+
+/* Returns 1 if the frame with this PTS (in microseconds) must be an IDR. */
+static int idr_trigger_requested(X264Context *x4, int64_t pts_us)
+{
+    struct stat st;
+    char content[64];
+    int force = 0;
+
+    if (!x4->idr_trigger_file)
+        return 0;
+    ff_mutex_lock(&idr_mutex);
+    if (stat(x4->idr_trigger_file, &st) == 0 &&
+        idr_read_content(x4->idr_trigger_file, content, sizeof(content))) {
+        if (idr_file_changed(&st, content)) {
+            idr_last_stat = st;
+            idr_have_stat = 1;
+            memcpy(idr_last_content, content, sizeof(content));
+            idr_generation++;
+            idr_target_us = idr_read_target(x4->idr_trigger_file, x4->idr_trigger_pts_offset, pts_us);
+        }
+    }
+    if (x4->idr_seen_generation != idr_generation && pts_us >= idr_target_us) {
+        x4->idr_seen_generation = idr_generation;
+        force = 1;
+    }
+    ff_mutex_unlock(&idr_mutex);
+    return force;
+}
+
 static int setup_frame(AVCodecContext *ctx, const AVFrame *frame,
                        x264_picture_t **ppic)
 {
@@ -527,6 +656,12 @@ static int setup_frame(AVCodecContext *ctx, const AVFrame *frame,
     default:
         pic->i_type = X264_TYPE_AUTO;
         break;
+    }
+    if (pic->i_type != X264_TYPE_IDR && frame->pts != AV_NOPTS_VALUE &&
+        idr_trigger_requested(x4, av_rescale_q(frame->pts, ctx->time_base, AV_TIME_BASE_Q))) {
+        pic->i_type = X264_TYPE_IDR;
+        av_log(ctx, AV_LOG_INFO, "forcing IDR at pts %.3f (idr-trigger-file %s)\n",
+               frame->pts * av_q2d(ctx->time_base), x4->idr_trigger_file);
     }
     reconfig_encoder(ctx, frame);
 
@@ -1069,6 +1204,8 @@ static av_cold int X264_init(AVCodecContext *avctx)
     int sw,sh;
     int ret;
 
+    idr_trigger_init(x4);
+
     if (avctx->global_quality > 0)
         av_log(avctx, AV_LOG_WARNING, "-qscale is ignored, -crf is recommended.\n");
 
@@ -1565,6 +1702,8 @@ static const AVOption options[] = {
     { "esa",           NULL, 0, AV_OPT_TYPE_CONST, { .i64 = X264_ME_ESA },  INT_MIN, INT_MAX, VE, .unit = "motion-est" },
     { "tesa",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = X264_ME_TESA }, INT_MIN, INT_MAX, VE, .unit = "motion-est" },
     { "forced-idr",   "If forcing keyframes, force them as IDR frames.",                                  OFFSET(forced_idr),  AV_OPT_TYPE_BOOL,   { .i64 = 0 }, -1, 1, VE },
+    { "idr-trigger-file", "Force an IDR frame whenever this file is created or modified (live splice points).", OFFSET(idr_trigger_file), AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
+    { "idr-trigger-pts-offset", "Offset between this encoder's timestamps and the output stream's, subtracted from a time in the trigger file.", OFFSET(idr_trigger_pts_offset), AV_OPT_TYPE_DURATION, { .i64 = 1400000 }, INT64_MIN, INT64_MAX, VE },
     { "coder",    "Coder type",                                           OFFSET(coder), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, VE, .unit = "coder" },
     { "default",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = -1 }, INT_MIN, INT_MAX, VE, .unit = "coder" },
     { "cavlc",            NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 },  INT_MIN, INT_MAX, VE, .unit = "coder" },
