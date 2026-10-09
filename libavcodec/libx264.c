@@ -112,6 +112,7 @@ typedef struct X264Context {
     int forced_idr;
     char *idr_trigger_file;
     int64_t idr_trigger_pts_offset;
+    int idr_next_target;
     unsigned idr_seen_generation;
     int coder;
     int a53_cc;
@@ -496,7 +497,9 @@ static AVMutex idr_mutex = AV_MUTEX_INITIALIZER;
 static struct stat idr_last_stat;
 static int idr_have_stat;
 static unsigned idr_generation;
-static int64_t idr_target_us;
+#define IDR_MAX_TARGETS 4
+static int64_t idr_targets_us[IDR_MAX_TARGETS];
+static int idr_ntargets;
 
 static char idr_last_content[64];
 
@@ -527,25 +530,32 @@ static int idr_file_changed(const struct stat *st, const char *content)
            strcmp(content, idr_last_content) != 0;
 }
 
-/* Reads the target time from the trigger file; falls back to "a little from
- * now" when it holds no usable time. */
-static int64_t idr_read_target(const char *path, int64_t offset_us, int64_t pts_us)
+/* Reads the target times from the trigger file: up to IDR_MAX_TARGETS numbers
+ * separated by whitespace, in ascending order. Each is an IDR to force on the
+ * first frame at or after it - a splice needs the one at its own instant, and
+ * may want an earlier one to keep the natural keyframe grid clear of it. Falls
+ * back to a single "a little from now" when the file holds no usable time. */
+static int idr_read_targets(const char *path, int64_t offset_us, int64_t pts_us, int64_t *out)
 {
-    int64_t target = pts_us + IDR_TRIGGER_LEAD_US;
+    int n = 0;
     FILE *f = fopen(path, "r");
     double t;
 
     if (f) {
-        if (fscanf(f, "%lf", &t) == 1 && t >= 0 && t < 1e9) {
-            int64_t want = (int64_t)(t * 1e6) - offset_us;
-            if (want < pts_us)
-                want = pts_us;
-            if (want <= pts_us + 60000000)
-                target = want;
+        while (n < IDR_MAX_TARGETS && fscanf(f, "%lf", &t) == 1) {
+            if (t >= 0 && t < 1e9) {
+                int64_t want = (int64_t)(t * 1e6) - offset_us;
+                if (want < pts_us)
+                    want = pts_us;
+                if (want <= pts_us + 60000000)
+                    out[n++] = want;
+            }
         }
         fclose(f);
     }
-    return target;
+    if (!n)
+        out[n++] = pts_us + IDR_TRIGGER_LEAD_US;
+    return n;
 }
 
 /* Record the trigger file's current state, so a file that already exists at
@@ -563,6 +573,7 @@ static void idr_trigger_init(X264Context *x4)
         idr_have_stat = 1;
     }
     x4->idr_seen_generation = idr_generation;
+    x4->idr_next_target = idr_ntargets;
     ff_mutex_unlock(&idr_mutex);
 }
 
@@ -583,11 +594,16 @@ static int idr_trigger_requested(X264Context *x4, int64_t pts_us)
             idr_have_stat = 1;
             memcpy(idr_last_content, content, sizeof(content));
             idr_generation++;
-            idr_target_us = idr_read_target(x4->idr_trigger_file, x4->idr_trigger_pts_offset, pts_us);
+            idr_ntargets = idr_read_targets(x4->idr_trigger_file, x4->idr_trigger_pts_offset, pts_us, idr_targets_us);
         }
     }
-    if (x4->idr_seen_generation != idr_generation && pts_us >= idr_target_us) {
+    if (x4->idr_seen_generation != idr_generation) {
         x4->idr_seen_generation = idr_generation;
+        x4->idr_next_target = 0;
+    }
+    /* One IDR per frame however many targets it has passed. */
+    while (x4->idr_next_target < idr_ntargets && pts_us >= idr_targets_us[x4->idr_next_target]) {
+        x4->idr_next_target++;
         force = 1;
     }
     ff_mutex_unlock(&idr_mutex);
