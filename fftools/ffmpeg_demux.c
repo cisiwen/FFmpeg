@@ -70,6 +70,9 @@ typedef struct DemuxStream {
 
 
     int                      wrap_correction_done;
+    /* last dts of this stream after ts_unwrap_copyts(), and whether there is one yet */
+    int64_t                  unwrap_last_dts;
+    int                      unwrap_have;
     int                      saw_first_ts;
     ///< dts of the first packet read for this stream (in AV_TIME_BASE units)
     int64_t                  first_dts;
@@ -215,15 +218,6 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
     int64_t pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
                                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
-    if (copy_ts && ds->next_dts != AV_NOPTS_VALUE &&
-        fmt_is_discont && ist->st->pts_wrap_bits < 60) {
-        int64_t wrap_dts = av_rescale_q_rnd(pkt->dts + (1LL<<ist->st->pts_wrap_bits),
-                                            pkt->time_base, AV_TIME_BASE_Q,
-                                            AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
-        if (FFABS(wrap_dts - ds->next_dts) < FFABS(pkt_dts - ds->next_dts)/10)
-            disable_discontinuity_correction = 0;
-    }
-
     if (ds->next_dts != AV_NOPTS_VALUE && !disable_discontinuity_correction) {
         int64_t delta = pkt_dts - ds->next_dts;
         if (fmt_is_discont) {
@@ -273,11 +267,63 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
     d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
 }
 
+/*
+ * With -copyts, timestamps of an input that wraps (MPEG-TS: 33 bits, every 26.5 hours) are made
+ * continuous here, one stream at a time, by picking the wrap each timestamp is nearest to the
+ * stream's previous dts.
+ *
+ * ffmpeg used to do this through ts_discontinuity_detect() and the one offset it keeps for the whole
+ * input, which cannot work: audio and video never wrap on the same packet, so the stream that wraps
+ * first moved the shared offset by a wrap and thereby pushed the other stream's last packets from
+ * before its own wrap a whole wrap too far ahead; that stream then corrected again, the offset ended
+ * up one wrap too large, and the timeline jumped 26.5 hours forward. A frame-rate filter then
+ * duplicates frames to fill the gap (2.4 million at 25fps) and the output stops for hours. A packet
+ * whose pts is on the other side of the wrap from its dts (B-frames at the wrap) was corrected by
+ * only one of the two. Both are avoided by not sharing anything: each stream tracks its own last dts,
+ * and each packet's pts is placed next to its own dts.
+ */
+static int64_t ts_round_div(int64_t a, int64_t b)
+{
+    return (a >= 0 ? a + b / 2 : a - b / 2) / b;
+}
+
+static void ts_unwrap_copyts(Demuxer *d, InputStream *ist, AVPacket *pkt)
+{
+    DemuxStream *ds = ds_from_ist(ist);
+    const int bits = ist->st->pts_wrap_bits;
+    int64_t wrap, k;
+
+    if (!copy_ts || !(d->f.ctx->iformat->flags & AVFMT_TS_DISCONT) || bits >= 60 ||
+        pkt->dts == AV_NOPTS_VALUE)
+        return;
+    if (ist->par->codec_type != AVMEDIA_TYPE_VIDEO && ist->par->codec_type != AVMEDIA_TYPE_AUDIO)
+        return;
+    wrap = 1LL << bits;
+
+    if (ds->unwrap_have) {
+        k = ts_round_div(ds->unwrap_last_dts - pkt->dts, wrap);
+        if (k) {
+            pkt->dts += k * wrap;
+            if (pkt->pts != AV_NOPTS_VALUE)
+                pkt->pts += k * wrap;
+        }
+    }
+    if (pkt->pts != AV_NOPTS_VALUE) {
+        k = ts_round_div(pkt->dts - pkt->pts, wrap);
+        if (k)
+            pkt->pts += k * wrap;
+    }
+    ds->unwrap_last_dts = pkt->dts;
+    ds->unwrap_have = 1;
+}
+
 static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
                                      AVPacket *pkt)
 {
     int64_t offset = av_rescale_q(d->ts_offset_discont, AV_TIME_BASE_Q,
                                   pkt->time_base);
+
+    ts_unwrap_copyts(d, ist, pkt);
 
     // apply previously-detected timestamp-discontinuity offset
     // (to all streams, not just audio/video)
